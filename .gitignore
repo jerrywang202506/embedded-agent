@@ -23,6 +23,13 @@ taf/pico/build/
 workspace/changes/
 changes/
 
+# ChromaDB 持久化数据（运行时生成）
+knowledge/.chroma_db/
+test_chroma_db/
+
+# 临时测试脚本
+test_path_migration.py
+
 # Robot Framework 日志
 *.log
 output.xml
