@@ -77,13 +77,16 @@ class EmbeddedKnowledgeBase:
 
     # ==================== 1. 解析 (吸收 RAGFlow 精华) ====================
 
-    def _parse_pdf(self, pdf_path: str) -> List[Dict]:
-        """版式感知 PDF 解析: 优先识别寄存器表"""
+    def _parse_pdf(self, pdf_path: str, page_window: int = 1) -> List[Dict]:
+        """版式感知 PDF 解析: 优先识别寄存器表。
+        对于超大型手册，page_window > 1 可将多页合并为一个 chunk，减少总数。"""
         chunks = []
         try:
             import pdfplumber
             with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
+                current_text = ""
+                start_page = 1
+                for idx, page in enumerate(pdf.pages):
                     tables = page.extract_tables()
                     for table in tables:
                         md_table = self._table_to_markdown(table)
@@ -94,22 +97,47 @@ class EmbeddedKnowledgeBase:
                                 "page": page.page_number
                             })
                     text = page.extract_text()
-                    if text and text.strip():
-                        chunks.append({
-                            "type": "paragraph",
-                            "content": text.strip(),
-                            "page": page.page_number
-                        })
-        except ImportError:
-            doc = fitz.open(pdf_path)
-            for page_num in range(len(doc)):
-                text = doc[page_num].get_text()
-                if text.strip():
+                    if text:
+                        current_text += "\n\n" + text
+                    if (idx + 1) % page_window == 0:
+                        if current_text.strip():
+                            chunks.append({
+                                "type": "paragraph",
+                                "content": current_text.strip(),
+                                "page": start_page
+                            })
+                        current_text = ""
+                        start_page = page.page_number + 1
+                if current_text.strip():
                     chunks.append({
                         "type": "paragraph",
-                        "content": text.strip(),
-                        "page": page_num + 1
+                        "content": current_text.strip(),
+                        "page": start_page
                     })
+        except ImportError:
+            doc = fitz.open(pdf_path)
+            total = len(doc)
+            current_text = ""
+            start_page = 1
+            for page_num in range(total):
+                text = doc[page_num].get_text()
+                if text:
+                    current_text += "\n\n" + text
+                if (page_num + 1) % page_window == 0:
+                    if current_text.strip():
+                        chunks.append({
+                            "type": "paragraph",
+                            "content": current_text.strip(),
+                            "page": start_page
+                        })
+                    current_text = ""
+                    start_page = page_num + 2
+            if current_text.strip():
+                chunks.append({
+                    "type": "paragraph",
+                    "content": current_text.strip(),
+                    "page": start_page
+                })
         return chunks
 
     def _table_to_markdown(self, table: List[List]) -> str:
@@ -130,9 +158,25 @@ class EmbeddedKnowledgeBase:
         content = Path(code_path).read_text(encoding="utf-8")
         return [{"type": "code", "content": content, "page": 1}]
 
+    def _parse_html(self, html_path: str) -> List[Dict]:
+        """提取 HTML 中的纯文本，去除 script/style/nav 等标签内容"""
+        raw = Path(html_path).read_text(encoding="utf-8")
+        # 去除 script 和 style 标签及其内容
+        raw = re.sub(r'<script[^>]*>.*?</script>', '', raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r'<style[^>]*>.*?</style>', '', raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r'<nav[^>]*>.*?</nav>', '', raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r'<header[^>]*>.*?</header>', '', raw, flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(r'<footer[^>]*>.*?</footer>', '', raw, flags=re.DOTALL | re.IGNORECASE)
+        # 去除其余标签，保留文本
+        text = re.sub(r'<[^>]+>', ' ', raw)
+        # 合并多余空白
+        text = re.sub(r'\s+', ' ', text).strip()
+        return [{"type": "html_text", "content": text, "page": 1}]
+
     # ==================== 2. 分块 (吸收 LlamaIndex 精华) ====================
 
-    MAX_CHUNK_SIZE = 1500  # 嵌入模型上下文长度限制，超过则进一步切分
+    MAX_CHUNK_SIZE = 4000  # 嵌入模型上下文长度限制，超过则进一步切分
+    # 实测 nomic-embed-text 可安全处理 5000 字符，留余量取 4000
 
     def _chunk_semantic(self, raw_chunks: List[Dict], source: str) -> List[Dict]:
         results = []
@@ -186,37 +230,54 @@ class EmbeddedKnowledgeBase:
 
     # ==================== 3. 嵌入 (保持 Ollama) ====================
 
-    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """批量嵌入: 使用 Ollama /api/embed 接口，一次性处理多条文本"""
+    def _embed_batch(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
+        """批量嵌入: 使用 Ollama /api/embed 接口，分批处理避免单次请求过大"""
         if not texts:
             return []
-        try:
-            r = requests.post(
-                f"{self.ollama_url}/api/embed",
-                json={"model": self.model_embed, "input": texts},
-                timeout=60
-            )
-            r.raise_for_status()
-            data = r.json()
-            embeddings = data.get("embeddings", [])
-            # 若 API 返回单条格式（旧版），做兼容处理
-            if not embeddings and "embedding" in data:
-                return [data["embedding"]]
-            return embeddings
-        except Exception:
-            # 降级: 逐条调用 /api/embeddings
-            return [self._embed_single(t) for t in texts]
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            try:
+                r = requests.post(
+                    f"{self.ollama_url}/api/embed",
+                    json={"model": self.model_embed, "input": batch},
+                    timeout=120
+                )
+                r.raise_for_status()
+                data = r.json()
+                embeddings = data.get("embeddings", [])
+                if not embeddings and "embedding" in data:
+                    embeddings = [data["embedding"]]
+                all_embeddings.extend(embeddings)
+            except Exception as e:
+                # 降级: 该批次逐条调用，单条失败则返回零向量占位
+                print(f"[KB] Batch embed failed ({e}), falling back to single...")
+                for t in batch:
+                    try:
+                        all_embeddings.append(self._embed_single(t))
+                    except Exception as e2:
+                        print(f"[KB] Single embed failed, using zero vector: {e2}")
+                        all_embeddings.append([0.0] * self.embed_dim)
+        return all_embeddings
 
     def _embed_single(self, text: str) -> List[float]:
-        # 若文本超长，截断以避免模型上下文溢出
-        safe_text = text[:self.MAX_CHUNK_SIZE] if len(text) > self.MAX_CHUNK_SIZE else text
-        r = requests.post(
-            f"{self.ollama_url}/api/embeddings",
-            json={"model": self.model_embed, "prompt": safe_text},
-            timeout=30
-        )
-        r.raise_for_status()
-        return r.json()["embedding"]
+        """单条嵌入，带多级截断重试，最终失败返回零向量"""
+        limits = [self.MAX_CHUNK_SIZE, 2000, 1000, 500]
+        for limit in limits:
+            safe_text = text[:limit] if len(text) > limit else text
+            try:
+                r = requests.post(
+                    f"{self.ollama_url}/api/embeddings",
+                    json={"model": self.model_embed, "prompt": safe_text},
+                    timeout=30
+                )
+                r.raise_for_status()
+                return r.json()["embedding"]
+            except Exception:
+                continue
+        # 全部重试失败，返回零向量（不影响相似度计算，但会排在最后）
+        print(f"[KB] Warning: embed failed after all retries, returning zero vector (text len={len(text)})")
+        return [0.0] * self.embed_dim
 
     # ==================== 4. 索引 (保持 ChromaDB) ====================
 
@@ -243,11 +304,22 @@ class EmbeddedKnowledgeBase:
 
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            raw_chunks = self._parse_pdf(str(path))
+            # 根据页数自动选择合并窗口：>500页用窗口5，>1000页用窗口10
+            doc = fitz.open(str(path))
+            page_count = len(doc)
+            doc.close()
+            window = 1
+            if page_count > 1000:
+                window = 10
+            elif page_count > 500:
+                window = 5
+            raw_chunks = self._parse_pdf(str(path), page_window=window)
         elif suffix in (".md", ".txt"):
             raw_chunks = self._parse_markdown(str(path))
         elif suffix in (".c", ".h", ".cpp"):
             raw_chunks = self._parse_code(str(path))
+        elif suffix in (".html", ".htm"):
+            raw_chunks = self._parse_html(str(path))
         else:
             raw_chunks = [{"type": "text", "content": path.read_text(encoding="utf-8"), "page": 1}]
 

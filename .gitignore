@@ -27,6 +27,20 @@ changes/
 knowledge/.chroma_db/
 test_chroma_db/
 
+# Robot Framework 文档附属文件（非知识源）
+knowledge/robot_framework/*_files/
+knowledge/robot_framework/**/images/
+
+# Pico SDK 文档非文本资源
+knowledge/pico_sdk/*.jpg
+knowledge/pico_sdk/*.png
+knowledge/pico_sdk/*.svg
+knowledge/pico_sdk/*.css
+knowledge/pico_sdk/*.js
+knowledge/pico_sdk/*.html
+knowledge/pico_sdk/Doxyfile*
+knowledge/pico_sdk/CMakeLists.txt
+
 # 临时测试脚本
 test_path_migration.py
 
